@@ -6,6 +6,9 @@ writes frontend/data/level.json for the display. Run once a minute from cron.
 Gauge settings (from Gillian's FUXA config):
   Modbus/TCP 192.168.1.181:502, device 1, address 300101, Int16,
   4.00 mA = empty bag, 20.00 mA = full bag
+
+Each result is also POSTed to Watto when WATTO_TOKEN is set. WATTO_URL
+overrides the default endpoint.
 """
 
 import json
@@ -14,6 +17,7 @@ import socket
 import struct
 import sys
 import tempfile
+import urllib.request
 from datetime import datetime, timezone
 
 GAUGE_HOST = "192.168.1.181"
@@ -24,6 +28,9 @@ RAW_PER_MA = 1000.0     # register reports microamps (12716 -> 12.716 mA)
 EMPTY_MA = 4.0
 FULL_MA = 20.0
 TIMEOUT_S = 5
+
+WATTO_URL = os.environ.get("WATTO_URL", "https://wautils.nova-labs.org/api/dust_collector")
+WATTO_TOKEN = os.environ.get("WATTO_TOKEN")
 
 OUTPUT_FILE = os.path.normpath(os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "frontend", "data", "level.json"))
@@ -82,6 +89,20 @@ def write_atomically(path, payload):
     os.replace(tmp_path, path)
 
 
+def post_to_watto(payload):
+    if not WATTO_TOKEN:
+        print("Watto post skipped: WATTO_TOKEN is not set", file=sys.stderr)
+        return
+    request = urllib.request.Request(
+        WATTO_URL, data=json.dumps(payload).encode(), method="POST",
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {WATTO_TOKEN}"})
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT_S):
+            pass
+    except OSError as e:  # URLError and HTTPError are OSErrors
+        print(f"Watto post failed: {e}", file=sys.stderr)
+
+
 def main():
     now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     payload = {"ok": True, "checked_at": now, "error": None, "reading": None}
@@ -95,6 +116,7 @@ def main():
         print(f"Gauge read failed: {e}", file=sys.stderr)
 
     write_atomically(OUTPUT_FILE, payload)
+    post_to_watto(payload)
     return 0 if payload["ok"] else 1
 
 
