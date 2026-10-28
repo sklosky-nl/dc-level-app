@@ -37,10 +37,11 @@ rsync -av --exclude '.DS_Store' --exclude '__pycache__/' "$LOCAL_DIR/poller/" "$
 
 echo ""
 echo "⏱  Installing cron job (gauge read every minute)..."
+# Only the poller line is replaced, so the WATTO_TOKEN line above it survives
 ssh "$SERVER" "(crontab -l 2>/dev/null | grep -v dc_level_poller.py; echo '$CRON_LINE') | crontab -"
 
 echo ""
-echo "📟 Reading gauge now..."
+echo "📟 Reading gauge now (Watto post is skipped here; only cron has the token)..."
 ssh "$SERVER" "/usr/bin/python3 $REMOTE_DIR/poller/dc_level_poller.py; cat $REMOTE_DIR/frontend/data/level.json"
 
 echo ""
@@ -52,5 +53,5 @@ echo "🌐 URL: http://xibo.space.nova-labs.org/dc-level/"
 echo ""
 echo "Note: Bump the ?v= cache-busting query in index.html when CSS/JS changes,"
 echo "      or hard refresh (Cmd+Shift+R) in your browser."
-echo "      Poller errors go to syslog: journalctl -t dc-level-poller"
+echo "      Poller errors go to syslog: sudo journalctl -t dc-level-poller"
 echo ""

@@ -2,10 +2,11 @@
 
 A live fill-level display for the Nova Labs dust collector bag, built for the Xibo signage screens.
 A level gauge on the collector is read once a minute over Modbus/TCP. The display shows how full the
-1 yd³ collection bag is, so members know when it needs emptying before it overflows.
+1 yd³ collection bag is, so members know when it needs emptying before it overflows. Each reading is also
+sent to Watto, which keeps the history and powers the members-only dust collector page.
 
 **Live:** http://xibo.space.nova-labs.org/dc-level/  
-**Version:** `v0.2.1`
+**Version:** `v0.3.0`
 
 ![Dust Collection Monitor display](docs/screenshot.png)
 
@@ -55,8 +56,8 @@ The header dot shows **Connected**, **Gauge Offline**, or **Disconnected** (the 
 ```
 Level gauge (4–20 mA)                xibo.space.nova-labs.org (Ubuntu, Apache)
 192.168.1.181:502   ──Modbus/TCP──▶   cron, every minute
-                                        └─ poller/dc_level_poller.py
-                                             │ writes
+                                        └─ poller/dc_level_poller.py ──POST──▶ Watto (wautils.nova-labs.org)
+                                             │ writes                           history + members-only page
                                              ▼
                                       /opt/dc-level-app/frontend/data/level.json
                                              │ served by Apache at /dc-level/
@@ -69,6 +70,9 @@ Level gauge (4–20 mA)                xibo.space.nova-labs.org (Ubuntu, Apache)
 - Apache serves the page and the JSON file as static files. There is no backend service to keep running.
 - If a gauge read fails, the poller keeps the last good reading and sets `"ok": false`. The display then
   greys out instead of showing a wrong number.
+- After writing the file, the poller POSTs the same JSON to Watto's `/api/dust_collector` endpoint on every
+  run, failed reads included. This needs a token (see [Watto reporting](#watto-reporting)). If the post
+  fails, the poller logs it and moves on. The display isn't affected, and missed readings aren't re-sent.
 
 ### `level.json`
 
@@ -131,7 +135,7 @@ dc-level-app/
 │   ├── js/bag.js              ← SVG bulk bag and sawdust drawing
 │   └── data/level.json        ← written by the poller (gitignored, never deployed)
 ├── poller/
-│   └── dc_level_poller.py     ← Modbus reader, run by cron; deployed to /opt/dc-level-app/poller
+│   └── dc_level_poller.py     ← Modbus reader and Watto reporter, run by cron; deployed to /opt/dc-level-app/poller
 ├── scripts/
 │   ├── deploy.sh              ← push changes and install the cron job (no sudo)
 │   └── server-setup.sh        ← one-time root setup: app directory + Apache route
@@ -158,6 +162,14 @@ dc-level-app/
 **Gauge settings** are the constants at the top of
 [`poller/dc_level_poller.py`](poller/dc_level_poller.py): host, port, unit ID, register, scaling, and empty/full mA.
 
+**Watto settings** are environment variables read by the poller. In production they're set in `sklosky`'s
+crontab (see [Watto reporting](#watto-reporting)):
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `WATTO_TOKEN` | not set | Bearer token for Watto. Without it the poller skips the post and logs `Watto post skipped: WATTO_TOKEN is not set`. It's a secret: keep it out of the repo, including `deploy.sh`. |
+| `WATTO_URL` | `https://wautils.nova-labs.org/api/dust_collector` | Where readings are posted |
+
 After changing anything in `frontend/`, bump the `?v=` cache-busting numbers in `index.html`. Otherwise
 screens and browsers may keep showing the old CSS or JS.
 
@@ -172,7 +184,8 @@ screens and browsers may keep showing the old CSS or JS.
 | Server | `xibo.space.nova-labs.org`: Ubuntu 20.04, Apache 2.4. Also runs the Xibo CMS and the sound monitoring app. |
 | URL | `http://xibo.space.nova-labs.org/dc-level/` |
 | App directory | `/opt/dc-level-app` (owned by `sklosky`) |
-| Cron | `sklosky`'s crontab, every minute. Errors go to syslog with the tag `dc-level-poller`. |
+| Cron | `sklosky`'s crontab, every minute. A `WATTO_TOKEN=` line above the poller line supplies the Watto token. Errors go to syslog with the tag `dc-level-poller`. |
+| Watto | Readings are POSTed to `https://wautils.nova-labs.org/api/dust_collector` |
 | Apache | `Alias /dc-level` + `ProxyPass /dc-level !` in `000-default.conf` and `000-default-le-ssl.conf`, before Xibo's catch-all `ProxyPass /` |
 
 > **Use http, not https.** The server's Let's Encrypt certificate expired in August 2022, so browsers
@@ -188,10 +201,31 @@ From a machine on the lab network (or VPN) with key-based SSH access to xibo:
 
 This script:
 1. copies `frontend/` (except `data/`) and `poller/` to `/opt/dc-level-app`
-2. adds the cron entry if it's missing (safe to re-run)
-3. takes one gauge reading and prints it
+2. replaces the poller's cron entry and leaves the rest of the crontab alone, so the `WATTO_TOKEN` line
+   survives (safe to re-run)
+3. takes one gauge reading and prints it. This run happens over SSH without the token, so it prints
+   `Watto post skipped: WATTO_TOKEN is not set`. That's expected; the cron runs have the token.
 
 The SSH user is set by `SERVER` at the top of the script. Change it if you deploy as someone else.
+
+### Watto reporting
+
+The Watto token lives only in `sklosky`'s crontab on xibo. To set or change it, run `crontab -e` on xibo
+and put the token line **above** the poller line, since cron only applies a variable to the lines after it:
+
+```
+WATTO_TOKEN=<token>
+* * * * * /usr/bin/python3 /opt/dc-level-app/poller/dc_level_poller.py 2>&1 | /usr/bin/logger -t dc-level-poller
+```
+
+`deploy.sh` re-adds the poller line at the bottom of the crontab, so the token line stays above it across
+deploys. Never put the token in `deploy.sh`'s `CRON_LINE`, because that file is committed.
+
+To check the token works, run the poller once with it on xibo. No output means the post succeeded:
+
+```bash
+export "$(crontab -l | grep '^WATTO_TOKEN=')"; python3 /opt/dc-level-app/poller/dc_level_poller.py
+```
 
 ### One-time server setup
 
@@ -204,7 +238,7 @@ ssh -t sklosky@xibo.space.nova-labs.org 'sudo bash ~/dc-level-app-setup.sh'
 
 It creates `/opt/dc-level-app`, backs up both Apache vhost files to `*.backup-<epoch>`, adds the `/dc-level`
 route, and runs `apache2ctl configtest`. It only reloads Apache if the test passes; otherwise it restores the
-backups. It's safe to re-run.
+backups. It's safe to re-run. After a rebuild, also add the Watto token (see [Watto reporting](#watto-reporting)).
 
 ---
 
@@ -232,6 +266,9 @@ Without access to the gauge, create `frontend/data/level.json` by hand using the
 `fill_percent` and `current_ma` to try different states. Set `read_at` to the current UTC time; older
 readings show as "Gauge Offline".
 
+Without `WATTO_TOKEN`, the poller skips the Watto post and says so. Don't set it locally unless you mean to
+send readings to the real Watto, or point `WATTO_URL` at a test endpoint.
+
 ---
 
 ## Operations and troubleshooting
@@ -239,9 +276,10 @@ readings show as "Gauge Offline".
 | Task | Command |
 |------|---------|
 | See the latest reading | `curl http://xibo.space.nova-labs.org/dc-level/data/level.json` |
-| Poller errors | on xibo: `journalctl -t dc-level-poller --since "1 hour ago"` |
-| Read the gauge by hand | on xibo: `python3 /opt/dc-level-app/poller/dc_level_poller.py && cat /opt/dc-level-app/frontend/data/level.json` |
-| Check the cron entry | on xibo: `crontab -l` |
+| Poller errors | on xibo: `sudo journalctl -t dc-level-poller --since "1 hour ago"` (needs sudo: syslog is only readable by the `adm` group) |
+| Read the gauge by hand | on xibo: `python3 /opt/dc-level-app/poller/dc_level_poller.py && cat /opt/dc-level-app/frontend/data/level.json` (skips the Watto post) |
+| Test the Watto post | on xibo: see [Watto reporting](#watto-reporting) |
+| Check the cron entry | on xibo: `crontab -l` (this prints the Watto token) |
 
 | Symptom | Likely cause |
 |---------|--------------|
@@ -250,6 +288,9 @@ readings show as "Gauge Offline".
 | **Disconnected** | The screen can't reach the xibo server, or Apache is down |
 | Old look after a deploy | Browser or player cache: bump `?v=` in `index.html` and redeploy |
 | Level looks wrong | Check the scaling in the poller against the physical bag (see [The level gauge](#the-level-gauge)) |
+| `Watto post skipped: WATTO_TOKEN is not set` in the poller log | The `WATTO_TOKEN` line is missing from the crontab, or it's below the poller line. Expected during `deploy.sh`'s own reading. |
+| `Watto post failed: HTTP Error 401` or `403` | The token is wrong or revoked. Ask Christopher Sexton for a new one and replace the crontab line. |
+| `Watto post failed: <urlopen error …>` | Watto is down or unreachable. The display isn't affected, and posts resume when Watto is back. |
 
 ---
 
@@ -257,6 +298,7 @@ readings show as "Gauge Offline".
 
 | Version | Date | Changes |
 |---------|------|---------|
+| v0.3.0 | 2026-10-28 | Poller also posts each reading to Watto (`WATTO_TOKEN`, `WATTO_URL`). Contributed by Christopher Sexton (#1). |
 | v0.2.1 | 2026-10-27 | Bag capacity changed to 1 yd³. Scales use two decimals. Bag subtitle comes from config. |
 | v0.2.0 | 2026-10-27 | Dust collection monitor: Modbus poller (cron), level bar, see-through sawdust bag, status sidebar |
 | v0.1.0 | 2026-10-27 | Hello world page and `/dc-level` Apache route on xibo |
@@ -264,4 +306,5 @@ readings show as "Gauge Offline".
 ---
 
 **Gauge configuration:** Gillian (FUXA)  
+**Watto reporting:** Christopher Sexton  
 **Author:** Stephen Klosky ([stephen.klosky@nova-labs.org](mailto:stephen.klosky@nova-labs.org))
